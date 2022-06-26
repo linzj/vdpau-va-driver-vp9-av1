@@ -85,6 +85,7 @@ const char *string_of_VdpCodec(VdpCodec codec)
         _(H264);
         _(VC1);
         _(VP9);
+        _(AV1);
 #undef _
     }
     return str;
@@ -496,6 +497,20 @@ void dump_VdpPictureInfoVP9(VdpPictureInfoVP9 *pic_info)
     DUMPm32(pic_info, mbModeLfDelta, 1, 2); // XXX: unsigned int?
     DUMPi(pic_info, uncompressedHeaderSize);
     DUMPi(pic_info, compressedHeaderSize);
+    INDENT(-1);
+    TRACE("};\n");
+    INDENT(-1);
+}
+
+void dump_VdpPictureInfoAV1(VdpPictureInfoAV1 *pic_info)
+{
+    INDENT(1);
+    TRACE("VdpPictureInfoAV1 = {\n");
+    INDENT(1);
+    DUMPi(pic_info, width);
+    DUMPi(pic_info, height);
+    DUMPx(pic_info, frame_offset);
+    DUMPx(pic_info, profile);
     INDENT(-1);
     TRACE("};\n");
     INDENT(-1);

@@ -75,6 +75,7 @@ struct object_context {
         VdpPictureInfoH264       h264;
         VdpPictureInfoVC1        vc1;
         VdpPictureInfoVP9        vp9;
+        VdpPictureInfoAV1        av1;
     }                            vdp_picture_info;
 };
 

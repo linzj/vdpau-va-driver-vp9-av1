@@ -33,6 +33,61 @@
 
 #define DEBUG 1
 #include "debug.h"
+// From libavcodec/av1.h
+// Constants (section 3).
+enum {
+    AV1_MAX_OPERATING_POINTS = 32,
+
+    AV1_MAX_SB_SIZE    = 128,
+    AV1_MI_SIZE        = 4,
+
+    AV1_MAX_TILE_WIDTH = 4096,
+    AV1_MAX_TILE_AREA  = 4096 * 2304,
+    AV1_MAX_TILE_ROWS  = 64,
+    AV1_MAX_TILE_COLS  = 64,
+
+    AV1_NUM_REF_FRAMES       = 8,
+    AV1_REFS_PER_FRAME       = 7,
+    AV1_TOTAL_REFS_PER_FRAME = 8,
+    AV1_PRIMARY_REF_NONE     = 7,
+
+    AV1_MAX_SEGMENTS = 8,
+    AV1_SEG_LVL_MAX  = 8,
+
+    AV1_SEG_LVL_ALT_Q      = 0,
+    AV1_SEG_LVL_ALT_LF_Y_V = 1,
+    AV1_SEG_LVL_REF_FRAME  = 5,
+    AV1_SEG_LVL_SKIP       = 6,
+    AV1_SEG_LVL_GLOBAL_MV  = 7,
+
+    AV1_SELECT_SCREEN_CONTENT_TOOLS = 2,
+    AV1_SELECT_INTEGER_MV           = 2,
+
+    AV1_SUPERRES_NUM       = 8,
+    AV1_SUPERRES_DENOM_MIN = 9,
+
+    AV1_INTERPOLATION_FILTER_SWITCHABLE = 4,
+
+    AV1_GM_ABS_ALPHA_BITS       = 12,
+    AV1_GM_ALPHA_PREC_BITS      = 15,
+    AV1_GM_ABS_TRANS_ONLY_BITS  = 9,
+    AV1_GM_TRANS_ONLY_PREC_BITS = 3,
+    AV1_GM_ABS_TRANS_BITS       = 12,
+    AV1_GM_TRANS_PREC_BITS      = 6,
+    AV1_WARPEDMODEL_PREC_BITS   = 16,
+
+    AV1_WARP_MODEL_IDENTITY    = 0,
+    AV1_WARP_MODEL_TRANSLATION = 1,
+    AV1_WARP_MODEL_ROTZOOM     = 2,
+    AV1_WARP_MODEL_AFFINE      = 3,
+    AV1_WARP_PARAM_REDUCE_BITS = 6,
+
+    AV1_DIV_LUT_BITS      = 8,
+    AV1_DIV_LUT_PREC_BITS = 14,
+    AV1_DIV_LUT_NUM       = 257,
+
+    AV1_MAX_LOOP_FILTER = 63,
+};
 
 // Translates VdpDecoderProfile to VdpCodec
 VdpCodec get_VdpCodec(VdpDecoderProfile profile)
@@ -66,6 +121,8 @@ VdpCodec get_VdpCodec(VdpDecoderProfile profile)
         return VDP_CODEC_VC1;
     case VDP_DECODER_PROFILE_VP9_PROFILE_0:
         return VDP_CODEC_VP9;
+    case VDP_DECODER_PROFILE_AV1_MAIN:
+        return VDP_CODEC_AV1;
     }
     return 0;
 }
@@ -87,6 +144,7 @@ VdpDecoderProfile get_VdpDecoderProfile(VAProfile profile)
     case VAProfileVC1Main:      return VDP_DECODER_PROFILE_VC1_MAIN;
     case VAProfileVC1Advanced:  return VDP_DECODER_PROFILE_VC1_ADVANCED;
     case VAProfileVP9Profile0:  return VDP_DECODER_PROFILE_VP9_PROFILE_0;
+    case VAProfileAV1Profile0:  return VDP_DECODER_PROFILE_AV1_MAIN;
     default:                    break;
     }
     return (VdpDecoderProfile)-1;
@@ -165,6 +223,12 @@ get_max_ref_frames(
             max_ref_frames = 3; // XXX: is this correct?
             break;
         }
+        case VDP_DECODER_PROFILE_AV1_MAIN:
+        case VDP_DECODER_PROFILE_AV1_PROFESSIONAL:
+        case VDP_DECODER_PROFILE_AV1_HIGH:
+        {
+          max_ref_frames = AV1_REFS_PER_FRAME;
+        }
     }
     return max_ref_frames;
 }
@@ -176,6 +240,8 @@ static inline int get_num_ref_frames(object_context_p obj_context)
         return obj_context->vdp_picture_info.h264.num_ref_frames;
     else if (obj_context->vdp_codec == VDP_CODEC_VP9)
         return 3; // XXX: "any particular frame can make use of at most 3 reference frames"
+    else if (obj_context->vdp_codec == VDP_CODEC_AV1)
+        return AV1_REFS_PER_FRAME; // XXX: "any particular frame can make use of at most 3 reference frames"
     return 2;
 }
 
@@ -552,6 +618,36 @@ translate_VASliceDataBuffer(
         }
         return 1;
     }
+
+    if (obj_context->vdp_codec == VDP_CODEC_AV1) {
+        /* Check we have the start code */
+        /* XXX: check for other codecs too? */
+        /* XXX: this assumes we get SliceParams before SliceData */
+        static const uint8_t start_code_prefix[3] = { 0x00, 0x00, 0x01 };
+        VASliceParameterBufferAV1 * const slice_params = obj_context->last_slice_params;
+        unsigned int i;
+        for (i = 0; i < obj_context->last_slice_params_count; i++) {
+            VASliceParameterBufferAV1* const slice_param = &slice_params[i];
+            uint8_t *buf = (uint8_t *)obj_buffer->buffer_data + slice_param->slice_data_offset;
+            if (trace_enabled())
+                trace_print("translate_VASliceDataBuffer: AV1: process slice param #%d\n", i);
+
+            if (memcmp(buf, start_code_prefix, sizeof(start_code_prefix)) != 0) {
+                if (append_VdpBitstreamBuffer(obj_context,
+                                              start_code_prefix,
+                                              sizeof(start_code_prefix)) < 0)
+                    return 0;
+            }
+            if (append_VdpBitstreamBuffer(obj_context,
+                                          buf,
+                                          slice_param->slice_data_size) < 0) {
+                D(bug("ERROR: append_VdpBitstreamBuffer\n"));
+                return 0;
+            }
+        }
+        return 1;
+    }
+
 
     if (obj_context->vdp_codec == VDP_CODEC_MPEG2)
         return translate_VASliceDataBuffer_MPEG2(driver_data,
@@ -1352,6 +1448,248 @@ translate_VASliceParameterBufferVP9(
     return 1;
 }
 
+// Translate VAPictureParameterBufferAV1
+static int
+translate_VAPictureParameterBufferAV1(
+    vdpau_driver_data_t *driver_data,
+    object_context_p    obj_context,
+    object_buffer_p     obj_buffer
+)
+{
+
+    VdpPictureInfoAV1 * const pic_info = &obj_context->vdp_picture_info.av1;
+    VADecPictureParameterBufferAV1* const pic_param = obj_buffer->buffer_data;
+    int i, j;
+
+    pic_info->width =  pic_param->frame_width_minus1 + 1;
+    pic_info->height =  pic_param->frame_height_minus1 + 1;
+
+    pic_info->frame_offset  = pic_param->order_hint;
+
+    pic_info->profile = 0;
+
+    pic_info->use_128x128_superblock = pic_param->seq_info_fields.fields.use_128x128_superblock;
+    pic_info->subsampling_x = pic_param->seq_info_fields.fields.subsampling_x;
+    pic_info->subsampling_y = pic_param->seq_info_fields.fields.subsampling_y;
+    pic_info->mono_chrome = pic_param->seq_info_fields.fields.mono_chrome;
+    pic_info->enable_filter_intra = pic_param->seq_info_fields.fields.enable_filter_intra;
+    pic_info->enable_intra_edge_filter = pic_param->seq_info_fields.fields.enable_intra_edge_filter;
+    pic_info->enable_interintra_compound = pic_param->seq_info_fields.fields.enable_interintra_compound;
+    pic_info->enable_masked_compound = pic_param->seq_info_fields.fields.enable_masked_compound;
+    pic_info->enable_dual_filter = pic_param->seq_info_fields.fields.enable_dual_filter;
+    pic_info->enable_order_hint = pic_param->seq_info_fields.fields.enable_order_hint;
+    pic_info->enable_jnt_comp = pic_param->seq_info_fields.fields.enable_jnt_comp;
+    pic_info->enable_cdef = pic_param->seq_info_fields.fields.enable_cdef;
+    pic_info->enable_fgs = pic_param->seq_info_fields.fields.film_grain_params_present;
+
+    pic_info->bit_depth_minus8 = pic_param->bit_depth_idx * 2;
+    pic_info->order_hint_bits_minus1 = pic_param->order_hint_bits_minus_1;
+    pic_info->enable_restoration = 1;
+
+    pic_info->enable_superres = pic_param->pic_info_fields.bits.use_superres;
+    pic_info->frame_type = pic_param->pic_info_fields.bits.frame_type;
+    pic_info->show_frame = pic_param->pic_info_fields.bits.show_frame;
+    pic_info->disable_cdf_update = pic_param->pic_info_fields.bits.disable_cdf_update;
+    pic_info->allow_screen_content_tools = pic_param->pic_info_fields.bits.allow_screen_content_tools;
+    pic_info->force_integer_mv = pic_param->pic_info_fields.bits.force_integer_mv;
+    pic_info->coded_denom = pic_param->pic_info_fields.bits.use_superres ?
+      (pic_param->superres_scale_denominator - AV1_SUPERRES_DENOM_MIN) : AV1_SUPERRES_NUM;
+    pic_info->allow_intrabc = pic_param->pic_info_fields.bits.allow_intrabc;
+    pic_info->allow_high_precision_mv = pic_param->pic_info_fields.bits.allow_high_precision_mv;
+    pic_info->switchable_motion_mode = pic_param->pic_info_fields.bits.is_motion_mode_switchable;
+    pic_info->use_ref_frame_mvs = pic_param->pic_info_fields.bits.use_ref_frame_mvs;
+    pic_info->disable_frame_end_update_cdf = pic_param->pic_info_fields.bits.disable_frame_end_update_cdf;
+    pic_info->allow_warped_motion = pic_param->pic_info_fields.bits.allow_warped_motion;
+    pic_info->use_superres = pic_param->pic_info_fields.bits.use_superres;
+
+    pic_info->delta_q_present = pic_param->mode_control_fields.bits.delta_q_present_flag;
+    pic_info->delta_q_res = pic_param->mode_control_fields.bits.log2_delta_q_res;
+    pic_info->tx_mode = pic_param->mode_control_fields.bits.tx_mode;
+    pic_info->reference_mode = pic_param->mode_control_fields.bits.reference_select;
+    pic_info->reduced_tx_set = pic_param->mode_control_fields.bits.reduced_tx_set_used;
+    pic_info->skip_mode = pic_param->mode_control_fields.bits.skip_mode_present;
+
+    pic_info->using_qmatrix = pic_param->qmatrix_fields.bits.using_qmatrix;
+    pic_info->qm_y = pic_param->qmatrix_fields.bits.qm_y;
+    pic_info->qm_u = pic_param->qmatrix_fields.bits.qm_u;
+    pic_info->qm_v = pic_param->qmatrix_fields.bits.qm_v;
+    // FIXME: should come from decode parameter.
+    pic_info->coded_lossless = 0;
+
+    pic_info->interp_filter = pic_param->interp_filter;
+
+    // tiling info
+    pic_info->num_tile_cols = pic_param->tile_cols;
+    pic_info->num_tile_rows = pic_param->tile_rows;
+    pic_info->context_update_tile_id = pic_param->context_update_tile_id;
+
+    for (i = 0; i < pic_info->num_tile_cols; ++i) {
+        pic_info->tile_widths[i] = pic_param->width_in_sbs_minus_1[i] + 1;
+    }
+    for (i = 0; i < pic_info->num_tile_rows; ++i) {
+        pic_info->tile_heights[i] = pic_param->height_in_sbs_minus_1[i] + 1;
+    }
+
+    pic_info->cdef_damping_minus_3 = pic_param->cdef_damping_minus_3;
+    pic_info->cdef_bits = pic_param->cdef_bits;
+
+    // va api
+    //  pic_param.cdef_y_strengths[i] =
+    //      (frame_header->cdef_y_pri_strength[i] << 2) +
+    //          frame_header->cdef_y_sec_strength[i];
+    //  pic_param.cdef_uv_strengths[i] =
+    //      (frame_header->cdef_uv_pri_strength[i] << 2) +
+    //          frame_header->cdef_uv_sec_strength[i];
+    for (i = 0; i < (1 << pic_param->cdef_bits); ++i) {
+        int cdef_y_pri_strength = pic_param->cdef_y_strengths[i] >> 2;
+        int cdef_y_sec_strength = pic_param->cdef_y_strengths[i] & 0x3;
+        pic_info->cdef_y_strength[i] = (cdef_y_pri_strength & 0x0F) | (cdef_y_sec_strength << 4);
+        int cdef_uv_pri_strength = pic_param->cdef_uv_strengths[i] >> 2;
+        int cdef_uv_sec_strength = pic_param->cdef_uv_strengths[i] & 0x3;
+        pic_info->cdef_uv_strength[i] = (cdef_uv_pri_strength & 0x0F) | (cdef_uv_sec_strength << 4);
+    }
+
+    // FIXME: need to read frame header to find out the real number.
+    pic_info->SkipModeFrame0 = 0;
+    pic_info->SkipModeFrame1 = 0;
+
+    pic_info->base_qindex = pic_param->base_qindex;
+    pic_info->qp_y_dc_delta_q = pic_param->y_dc_delta_q;
+    pic_info->qp_u_dc_delta_q = pic_param->u_dc_delta_q;
+    pic_info->qp_v_dc_delta_q = pic_param->v_dc_delta_q;
+    pic_info->qp_u_ac_delta_q = pic_param->u_ac_delta_q;
+    pic_info->qp_v_ac_delta_q = pic_param->v_ac_delta_q;
+    pic_info->qm_y = pic_param->qmatrix_fields.bits.qm_y;
+    pic_info->qm_u = pic_param->qmatrix_fields.bits.qm_u;
+    pic_info->qm_v = pic_param->qmatrix_fields.bits.qm_v;
+
+    pic_info->segmentation_enabled = pic_param->seg_info.segment_info_fields.bits.enabled;
+    pic_info->segmentation_update_map = pic_param->seg_info.segment_info_fields.bits.update_map;
+    pic_info->segmentation_update_data = pic_param->seg_info.segment_info_fields.bits.update_data;
+    pic_info->segmentation_temporal_update = pic_param->seg_info.segment_info_fields.bits.temporal_update;
+
+    /* Segmentation */
+    for (i = 0; i < AV1_MAX_SEGMENTS; ++i) {
+        pic_info->segmentation_feature_mask[i] = pic_param->seg_info.feature_mask[i];
+        for (j = 0; j < AV1_SEG_LVL_MAX; ++j) {
+            pic_info->segmentation_feature_data[i][j] = pic_param->seg_info.feature_data[i][j];
+        }
+    }
+
+    pic_info->loop_filter_level[0] = pic_param->filter_level[0];
+    pic_info->loop_filter_level[1] = pic_param->filter_level[1];
+    pic_info->loop_filter_level_u = pic_param->filter_level_u;
+    pic_info->loop_filter_level_v = pic_param->filter_level_v;
+    pic_info->loop_filter_sharpness = pic_param->loop_filter_info_fields.bits.sharpness_level;
+    memcpy(pic_info->loop_filter_ref_deltas, pic_param->ref_deltas, sizeof(int8_t) * 8);
+    memcpy(pic_info->loop_filter_mode_deltas, pic_param->mode_deltas, sizeof(int8_t) * 2);
+    pic_info->loop_filter_delta_enabled = pic_param->loop_filter_info_fields.bits.mode_ref_delta_enabled;
+    pic_info->loop_filter_delta_update = pic_param->loop_filter_info_fields.bits.mode_ref_delta_update;
+
+    pic_info->delta_lf_present = pic_param->mode_control_fields.bits.delta_lf_present_flag;
+    pic_info->delta_lf_res = pic_param->mode_control_fields.bits.log2_delta_lf_res;
+    pic_info->delta_lf_multi = pic_param->mode_control_fields.bits.delta_lf_multi;
+    pic_info->reserved4_2bits = 0;
+
+    pic_info->lr_unit_size[0] = 1 + pic_param->loop_restoration_fields.bits.lr_unit_shift;
+    pic_info->lr_unit_size[1] = 1 + pic_param->loop_restoration_fields.bits.lr_unit_shift - pic_param->loop_restoration_fields.bits.lr_uv_shift;
+    pic_info->lr_unit_size[2] = 1 + pic_param->loop_restoration_fields.bits.lr_unit_shift - pic_param->loop_restoration_fields.bits.lr_uv_shift;
+
+
+    pic_info->lr_type[0]      = pic_param->loop_restoration_fields.bits.yframe_restoration_type;
+    pic_info->lr_type[1]      = pic_param->loop_restoration_fields.bits.cbframe_restoration_type;
+    pic_info->lr_type[2]      = pic_param->loop_restoration_fields.bits.crframe_restoration_type;
+
+    // init ref_frame_map first.
+    for (i = 0; i < 8; ++i) {
+      if (!translate_VASurfaceID(driver_data,
+            /*(VASurfaceID)*/pic_param->ref_frame_map[i],
+            /*(VdpVideoSurface*)*/&pic_info->ref_frame_map[i]))
+      {
+        D(bug("ERROR: translate_VASurfaceID lastReference\n"));
+        return 0;
+      }
+    }
+
+
+    if (pic_param->primary_ref_frame == AV1_PRIMARY_REF_NONE) {
+        pic_info->primary_ref_frame = -1;
+    } else {
+        int8_t pri_ref_idx = pic_param->ref_frame_idx[pic_param->primary_ref_frame];
+        pic_info->primary_ref_frame = pic_info->ref_frame_map[pri_ref_idx];
+    }
+
+    //FIXME: should come from cur_frame
+    pic_info->temporal_layer_id = 0;
+    pic_info->spatial_layer_id = 0;
+
+    for (i = 0; i < AV1_REFS_PER_FRAME; ++i) {
+      /* Ref Frame List */
+      int8_t ref_idx = pic_param->ref_frame_idx[i];
+
+      pic_info->ref_frame[i].index = pic_info->ref_frame_map[ref_idx];
+      object_surface_p obj_surface = VDPAU_SURFACE(pic_param->ref_frame_map[ref_idx]);
+
+      pic_info->ref_frame[i].width = obj_surface->width;
+      pic_info->ref_frame[i].height = obj_surface->height;
+
+      /* Global Motion */
+      pic_info->global_motion[i].invalid = pic_param->wm[i].invalid;
+      pic_info->global_motion[i].wmtype = pic_param->wm[i].wmtype;
+      for (j = 0; j < 6; ++j) {
+        pic_info->global_motion[i].wmmat[j] = pic_param->wm[i].wmmat[j];
+      }
+    }
+
+    pic_info->apply_grain = pic_param->film_grain_info.film_grain_info_fields.bits.apply_grain;
+    pic_info->overlap_flag = pic_param->film_grain_info.film_grain_info_fields.bits.overlap_flag;
+    pic_info->scaling_shift_minus8 = pic_param->film_grain_info.film_grain_info_fields.bits.grain_scaling_minus_8;
+    pic_info->chroma_scaling_from_luma = pic_param->film_grain_info.film_grain_info_fields.bits.chroma_scaling_from_luma;
+    pic_info->ar_coeff_lag = pic_param->film_grain_info.film_grain_info_fields.bits.ar_coeff_lag;
+    pic_info->ar_coeff_shift_minus6 = pic_param->film_grain_info.film_grain_info_fields.bits.ar_coeff_shift_minus_6;
+    pic_info->grain_scale_shift = pic_param->film_grain_info.film_grain_info_fields.bits.grain_scale_shift;
+    pic_info->clip_to_restricted_range = pic_param->film_grain_info.film_grain_info_fields.bits.clip_to_restricted_range;
+    pic_info->num_y_points = pic_param->film_grain_info.num_y_points;
+
+    for (i = 0; i < 14; ++i) {
+        pic_info->scaling_points_y[i][0] = pic_param->film_grain_info.point_y_value[i];
+        pic_info->scaling_points_y[i][1] = pic_param->film_grain_info.point_y_scaling[i];
+    }
+    for (i = 0; i < 10; ++i) {
+        pic_info->scaling_points_cb[i][0] = pic_param->film_grain_info.point_cb_value[i];
+        pic_info->scaling_points_cb[i][1] = pic_param->film_grain_info.point_cb_scaling[i];
+        pic_info->scaling_points_cr[i][0] = pic_param->film_grain_info.point_cr_value[i];
+        pic_info->scaling_points_cr[i][1] = pic_param->film_grain_info.point_cr_scaling[i];
+    }
+    for (i = 0; i < 24; ++i) {
+        pic_info->ar_coeffs_y[i] = pic_param->film_grain_info.ar_coeffs_y[i];
+    }
+    for (i = 0; i < 25; ++i) {
+        pic_info->ar_coeffs_cb[i] = pic_param->film_grain_info.ar_coeffs_cb[i];
+        pic_info->ar_coeffs_cr[i] = pic_param->film_grain_info.ar_coeffs_cr[i];
+    }
+
+    pic_info->cb_mult = pic_param->film_grain_info.cb_mult;
+    pic_info->cb_luma_mult = pic_param->film_grain_info.cb_luma_mult;
+    pic_info->cb_offset = pic_param->film_grain_info.cb_offset;
+    pic_info->cr_mult = pic_param->film_grain_info.cr_mult;
+    pic_info->cr_luma_mult = pic_param->film_grain_info.cr_luma_mult;
+    pic_info->cr_offset = pic_param->film_grain_info.cr_offset;
+    return 1;
+}
+
+// Translate VASliceParameterBufferAV1
+static int
+translate_VASliceParameterBufferAV1(
+    vdpau_driver_data_t *driver_data,
+    object_context_p    obj_context,
+    object_buffer_p     obj_buffer
+)
+{
+    obj_context->last_slice_params       = obj_buffer->buffer_data;
+    obj_context->last_slice_params_count = obj_buffer->num_elements;
+    return 1;
+}
 // Translate VA buffer
 typedef int
 (*translate_buffer_func_t)(vdpau_driver_data_t *driver_data,
@@ -1391,6 +1729,8 @@ translate_buffer(
         _(VC1, SliceParameter),
         _(VP9, PictureParameter),
         _(VP9, SliceParameter),
+        _(AV1, PictureParameter),
+        _(AV1, SliceParameter),
 #undef _
         { VDP_CODEC_VC1, VABitPlaneBufferType, translate_nothing },
         { 0, VASliceDataBufferType, translate_VASliceDataBuffer },
@@ -1432,7 +1772,8 @@ vdpau_QueryConfigProfiles(
         VAProfileVC1Simple,
         VAProfileVC1Main,
         VAProfileVC1Advanced,
-        VAProfileVP9Profile0
+        VAProfileVP9Profile0,
+        VAProfileAV1Profile0,
     };
 
     int i, n = 0;
@@ -1488,6 +1829,9 @@ vdpau_QueryConfigEntrypoints(
         entrypoint = VAEntrypointVLD;
         break;
     case VAProfileVP9Profile0:
+        entrypoint = VAEntrypointVLD;
+        break;
+    case VAProfileAV1Profile0:
         entrypoint = VAEntrypointVLD;
         break;
     default:
@@ -1650,6 +1994,9 @@ vdpau_EndPicture(
             break;
         case VDP_CODEC_VP9:
             dump_VdpPictureInfoVP9(&obj_context->vdp_picture_info.vp9);
+            break;
+        case VDP_CODEC_AV1:
+            dump_VdpPictureInfoAV1(&obj_context->vdp_picture_info.av1);
             break;
         default:
             break;
